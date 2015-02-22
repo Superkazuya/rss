@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <libnotify/notify.h>
 
-#define CONFIG_FILE ".rssrc"
+#define CONFIG_FILE "~/.rssrc"
 #define LEN_SITE_NAME 32
 #define LEN_URL 128
 #define LEN_ETAG 128
@@ -279,10 +279,6 @@ write_config(xml_node* xmlnode)
     goto UNCHANGED;
   printf("thread %d:trying to write config file \n", xmlnode->rssthread->i);
   pthread_mutex_lock(&config_mutex);
-  /*
-  strncpy(exp, xmlnode->rssthread->site_name, LEN_SITE_NAME);
-  char exp[LEN_SITE_NAME+7] = "/sites/\0";
-  */
   char exp[LEN_SITE_NAME+7];
   xmlDoc* doc =  xmlParseFile(path);
   assert(doc != NULL);
