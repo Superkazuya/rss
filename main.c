@@ -330,8 +330,6 @@ int main()
       //goto ERROR;
   }
 
-  ///////////////////////
-
 
 ERROR:
   free(sites);
