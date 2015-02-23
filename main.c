@@ -1,18 +1,21 @@
 #include <curl/curl.h>
 #include <assert.h>
+
 #include <libxml/SAX2.h>
 #include <libxml/xpath.h>
 #include <libxml/xpathInternals.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <libnotify/notify.h>
+#include <pthread.h>
 
-#define CONFIG_FILE "~/.rssrc"
+//#include "rw_lock.h"
+
+#define CONFIG_FILE ".rssrc"
 #define LEN_SITE_NAME 32
 #define LEN_URL 128
 #define LEN_ETAG 128
@@ -24,9 +27,9 @@ typedef struct
   unsigned i;
   time_t last_pubDate;  //retrieve from last fetch
   char site_name[LEN_SITE_NAME];
-  char etag[LEN_ETAG];
+  char etag[LEN_ETAG]; //TODO: use it
   char url[LEN_URL];
-} rss_thread;
+} rss_site;
 
 struct MemStruct
 {
@@ -34,7 +37,7 @@ struct MemStruct
   size_t size;
 };
 
-typedef struct
+typedef struct//context
 {
   char state;   // 1:title 2:pubDate
   char is_ok;
@@ -42,7 +45,7 @@ typedef struct
   unsigned int depth;
   struct MemStruct content;
   time_t last_pubDate;
-  rss_thread* rssthread;
+  rss_site* rssthread;
   NotifyNotification* notification;
 } xml_node;
 
@@ -51,12 +54,13 @@ static void rss_on_endelem(void     *ctx, const xmlChar*name);
 static void rss_on_characters(void  *ctx, const xmlChar*ch, int len);
 static void rss_on_enddoc(void      *ctx);
 
-static void write_config(xml_node   *);
-static int  read_config(const       char *);
+static void thread_write_config(xml_node*);//todo
+static int  read_config(rss_site**);
 
 //global
-char path[32];
-pthread_mutex_t config_mutex;
+//#define path CONFIG_FILE
+char path[128];
+#define DELAY sleep(600)
 
 size_t
 parse_rss_callback(char* in, size_t size, size_t nmemb, void* storage)
@@ -71,33 +75,30 @@ parse_rss_callback(char* in, size_t size, size_t nmemb, void* storage)
   return(0);
 }
 
-void*
-fetch(void* rssthread_ptr)
+void* fetch(void* rssthread_ptr)
 {
-  //Curl for rss fetch
-  CURL *curl = curl_easy_init();
-  CURLcode res;
+  //C99 standard
+  xml_node current = {
+    .is_ok = 1
+  };
 
-  xml_node current;
-  memset(&current, 0, sizeof(xml_node));
-  current.is_ok = 1;
-
-  rss_thread* rssthread = rssthread_ptr;
+  rss_site* rssthread = rssthread_ptr;
   printf("----------------------------thread %d start!----------------------------\n", rssthread->i);
   current.last_pubDate = rssthread->last_pubDate;
   current.rssthread = rssthread;
   notify_init(rssthread->site_name);
 
-  xmlSAXHandler sax_handler;
-  memset(&sax_handler, 0, sizeof(xmlSAXHandler));
-  sax_handler.initialized = XML_SAX2_MAGIC;
-  sax_handler.startElement= rss_on_startelem;
-  sax_handler.endElement= rss_on_endelem;
-  sax_handler.characters = rss_on_characters;
-  sax_handler.endDocument = rss_on_enddoc;
+  xmlSAXHandler sax_handler = {
+    .initialized = XML_SAX2_MAGIC,
+    .startElement = rss_on_startelem,
+    .endElement= rss_on_endelem,
+    .characters = rss_on_characters,
+    .endDocument = rss_on_enddoc
+  };
 
   xmlParserCtxt* parse_context = xmlCreatePushParserCtxt(&sax_handler, &current, 0, 0, NULL);
 
+  CURL *curl = curl_easy_init();
   assert(curl != NULL);
   curl_easy_setopt(curl, CURLOPT_URL, rssthread->url);
   curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 40960);
@@ -105,15 +106,21 @@ fetch(void* rssthread_ptr)
 #ifdef CURL_DEBUG
   curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
 #endif
+  //CURL callbacks
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, parse_rss_callback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, parse_context);
+  /*  initialize finished  */
 
   printf("fetching from %s(%s):\n", rssthread->site_name, rssthread->url);
-  if((res = curl_easy_perform(curl)) != CURLE_OK)
-    pthread_exit(NULL);
+  int code;
+  if((code = (CURLcode)curl_easy_perform(curl)) != CURLE_OK) {
+    fprintf(stderr, "Error while fetching. Thread num = %d, site title = %s,  Error code = %d\n", rssthread->i, rssthread->site_name, code);
+    goto ERROR;
+  }
   else
     xmlParseChunk(parse_context, NULL, 0, 1);
 
+ ERROR:
   free(current.content.mem);
   curl_easy_cleanup(curl);
   pthread_exit(NULL);
@@ -175,7 +182,7 @@ rss_on_characters(void* ctx, const xmlChar* ch, int len)
     case 1:
     if((*mem_addr = realloc(*mem_addr, sizeof(char)*(*mem_size + len + 1))) == NULL)
     {
-      printf("OOM.\n");
+      fprintf(stderr, "OOM.\n");
       curr_node->is_ok = 0;
       return;
     }
@@ -189,14 +196,13 @@ rss_on_characters(void* ctx, const xmlChar* ch, int len)
     pubDate = curl_getdate(time, NULL);
     if(pubDate > curr_node->last_pubDate)
       curr_node->last_pubDate = pubDate;
-    //printf("\n");
     if(pubDate <= curr_node->rssthread->last_pubDate) //display only new feeds
     {
       curr_node->is_ok = 0;
 #ifdef DEBUG
       printf("\n----------------------------thread %d: so much for new feeds.----------------------------\n", curr_node->rssthread->i);
 #endif
-      write_config(curr_node);
+      thread_write_config(curr_node);
       pthread_exit(NULL);
     }
 #ifdef DEBUG
@@ -211,74 +217,75 @@ rss_on_characters(void* ctx, const xmlChar* ch, int len)
 static void
 rss_on_enddoc(void* ctx)
 {
-  xml_node* curr_node = ctx;
-  write_config(curr_node);
+  thread_write_config((xml_node* )ctx);
   printf("Config file written\n");
   pthread_exit(NULL);
 }
 
-static int
-read_config(const char* filename)
+int issue_fetch(rss_site* const _rss_site)
 {
-  unsigned int i;
-  rss_thread* rssthread = NULL;
-  xmlDoc* doc =  xmlParseFile(filename);
+}
+
+/* return the number of sites. 0 ==> something is wrong
+   TODO: get rid of assert()
+ */
+int read_config(rss_site** _sites)
+{
+  xmlDoc* doc =  xmlParseFile(path);
   assert(doc != NULL);
   xmlXPathContext* xpath_ctx = xmlXPathNewContext(doc);
   assert(xpath_ctx != NULL);
-  xmlXPathObject*  xpath_obj = xmlXPathEvalExpression("/sites/*", xpath_ctx); //Get all sites
+  xmlXPathObject*  xpath_obj = xmlXPathEvalExpression("/sites/*", xpath_ctx); 
   xmlXPathObject* xpath_content;
   assert(xpath_obj != NULL);
-
   xmlNodeSet* node_set = xpath_obj->nodesetval;
-  char* nodes;
-  rssthread = calloc(node_set->nodeNr, sizeof(rss_thread));
+  //config to XML
+
 #ifdef DEBUG
-  printf("%d thread(s) in total.\n", node_set->nodeNr);
+  printf("%d source website(s) in total.\n", node_set->nodeNr);
 #endif
+
+  //malloc all space as contiguous. use linked list for large site numbers.
+  if((*_sites = calloc(node_set->nodeNr, sizeof(rss_site))) == NULL){
+    fprintf(stderr, "malloc error.");
+    goto ERROR;
+  }
+  int i;
+  char* string;
   for(i = 0; i < node_set->nodeNr; i++)
   {
-    (rssthread+i)->i = i;
-    strncpy((rssthread+i)->site_name, node_set->nodeTab[i]->name, LEN_SITE_NAME);
+    rss_site* this_site = &(*_sites)[i];
+    this_site->i = i;
+    strncpy(this_site->site_name, node_set->nodeTab[i]->children->next->children->content, LEN_SITE_NAME);
+
+    //get url
     xpath_content = xmlXPathEvalExpression("//url", xpath_ctx);
     assert(xpath_content != NULL);
-    nodes = xpath_content->nodesetval->nodeTab[i]->children->content;
-#ifdef DEBUG
-#endif
-    strncpy((rssthread+i)->url, nodes, LEN_URL);
+    string = xpath_content->nodesetval->nodeTab[i]->children->content;
+    strncpy(this_site->url, string, LEN_URL);
 
     xpath_content = xmlXPathEvalExpression("//last_pubDate", xpath_ctx);
     assert(xpath_content != NULL);
-    nodes = xpath_content->nodesetval->nodeTab[i]->children->content;
-    (rssthread+i)->last_pubDate = atoi(nodes);
-    pthread_create(&(rssthread+i)->thread_id, NULL, fetch, (void*)(rssthread+i));
+    string = xpath_content->nodesetval->nodeTab[i]->children->content;
+    this_site->last_pubDate = atoi(string);
   }
-  xmlFreeDoc(doc);
-  printf("doc freed.\n");
-  for(i = 0; i < node_set->nodeNr; i++)
-  {
-    pthread_join((rssthread+i)->thread_id, NULL);
-#ifdef DEBUG
-    printf("thread %d destroyed.\n", (rssthread+i)->i);
-#endif
-  }
+
+ ERROR:
   xmlXPathFreeObject(xpath_obj);
   xmlXPathFreeContext(xpath_ctx);
-
-  free(rssthread);
-#ifdef DEBUG
-  printf("all thread(s) destroyed.\n");
-#endif
-  return(0);
+  xmlFreeDoc(doc);
+  return i;
 }
 
-static void
-write_config(xml_node* xmlnode)
+void thread_write_config(xml_node* xmlnode)
 {
-  if(xmlnode->last_pubDate <= xmlnode->rssthread->last_pubDate)
-    goto UNCHANGED;
+  /*
+  if(xmlnode->last_pubDate <= xmlnode->rssthread->last_pubDate){
+    printf("thread %d:no change made, exit.\n", xmlnode->rssthread->i);
+    return;
+    }*/
+  /*    
   printf("thread %d:trying to write config file \n", xmlnode->rssthread->i);
-  pthread_mutex_lock(&config_mutex);
   char exp[LEN_SITE_NAME+7];
   xmlDoc* doc =  xmlParseFile(path);
   assert(doc != NULL);
@@ -294,28 +301,40 @@ write_config(xml_node* xmlnode)
   printf("doc freed.\n");
   xmlXPathFreeObject(xpath_content);
   xmlXPathFreeContext(xpath_ctx);
-  pthread_mutex_unlock(&config_mutex);
   printf("thread %d:config file written.\n", xmlnode->rssthread->i);
-  return;
-UNCHANGED:
-  printf("thread %d:no change made, exit.\n", xmlnode->rssthread->i);
+  */
 }
 
-int
-main()
+int main()
 {
   sprintf(path, "%s/%s", getenv("HOME"), CONFIG_FILE);
   xmlInitParser();
-  pthread_mutex_init(&config_mutex, NULL);
   curl_global_init(CURL_GLOBAL_ALL);
-  while(1)
-  {
-    assert(read_config(path) == 0);
-    sleep(300);
+
+  rss_site* sites;
+  int site_num = read_config(&sites);
+  for(int i = 0; i < site_num; i++){
+    rss_site *this_site = &sites[i];
+    if(pthread_create(&(this_site->thread_id), NULL, fetch, (void *)this_site)) {
+      fprintf(stderr, "Error while creating thread %d\n", i);
+      goto ERROR;
+    }
   }
+
+    /* do something */
+
+  for(int i = 0; i < site_num; i++) {
+    rss_site *this_site = &sites[i];
+    if(pthread_join(this_site->thread_id, NULL))
+      fprintf(stderr, "Error while joining thread %d\n", i);
+      //goto ERROR;
+  }
+
+
+ERROR:
+  free(sites);
   xmlCleanupParser();
   xmlMemoryDump();
-  pthread_mutex_destroy(&config_mutex);
   return(EXIT_SUCCESS);
 }
 
